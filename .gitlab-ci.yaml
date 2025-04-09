@@ -1,0 +1,101 @@
+variables:
+  ROLE_ARN: "arn:aws:iam::594928134774:role/gitlab-ecs-cluster-deploy-role"
+  IMAGE_REGISTRY: "594928134774.dkr.ecr.us-east-1.amazonaws.com"
+  IMAGE_NAME: "nginx-web-app"
+
+
+stages:
+  - auth
+  - build
+  - deploy
+
+
+
+## Authenticate With AWS
+aws-assume-role:
+  stage: auth 
+  image: docker:stable       # Using the stable Docker image for the job
+  id_tokens:
+    GITLAB_OIDC_TOKEN:    # Set the OIDC token for GitLab to authenticate with AWS
+      aud: https://gitlab.com
+  before_script:
+    - apk add --no-cache python3 py3-pip
+    - pip3 install --no-cache-dir awscli
+  script:
+    # Retrieve temporary credentials - https://docs.gitlab.com/ci/cloud_services/aws/
+    - >
+      aws_sts_output=$(aws sts assume-role-with-web-identity
+      --role-arn ${ROLE_ARN}
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+      --web-identity-token ${GITLAB_OIDC_TOKEN}
+      --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+      --output text)
+    - export $(printf "AWS_ACCESS_KEY_ID=%s\n AWS_SECRET_ACCESS_KEY=%s\n AWS_SESSION_TOKEN=%s" $aws_sts_output)
+    - aws sts get-caller-identity     # Verify the credentials by retrieving the caller identity
+    - echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" >> build.env         # Expose AWS Credentials as environment variables to other jobs
+    - echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" >> build.env  
+    - echo "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" >> build.env 
+    - cat ./build.env   # Print the environment variables for debugging
+  artifacts:                                           # Export env vraibles file as an artifact to other jobs                                                                      
+    reports:
+      dotenv: build.env
+
+
+
+## Image build
+build-image:
+  stage: build
+  image: docker:stable     # Using the stable Docker image for the job
+  dependencies:
+    - aws-assume-role         # This job depends on the 'aws-assume-role' job to obtain AWS credentials
+  services:
+    - docker:dind                     # Start docker service inside the job container
+  rules:
+    - changes:
+      - image/**/*                  # Trigger image build only when files inside image/ directory are changed, otherwise I get one image tag for each commit
+  before_script:
+    - apk add --no-cache python3 py3-pip
+    - pip3 install --no-cache-dir awscli
+  script:         # The steps to build and push the Docker image to AWS ECR
+    - cd ./image/
+    - aws ecr get-login-password --region "us-east-1" | docker login --username AWS --password-stdin ${IMAGE_REGISTRY}      # Login to AWS ECR using the AWS credentials
+    - docker build . -t ${IMAGE_REGISTRY}/${IMAGE_NAME}:${CI_COMMIT_SHA}        # Build the Docker image and tag it with the Git commit SHA
+    - docker push ${IMAGE_REGISTRY}/${IMAGE_NAME}:${CI_COMMIT_SHA}      # Push the built image to the ECR registry with the same tag
+
+
+
+## ECS Deploy
+plan:
+  stage: deploy
+  dependencies:
+    - aws-assume-role               # Use AWS credentials env variables exposed in aws-assume-role job
+  image: 
+    name: hashicorp/terraform:1.11        # Using the specific Terraform Docker image for deployment
+    entrypoint: [""]                 # Override default entry point 'terraform' command
+  script:
+    # Deploy using Terraform
+    - cd ./terraform/
+    - terraform init      # Initialize Terraform (downloads providers and sets up the working directory)
+    - terraform validate      # Validate the configuration files for correctness
+    - terraform plan -out=tfplan        # Generate an execution plan and save it to a file (tfplan)
+  artifacts:                                 # Store the plan in GitLab artefact storage so we can use it in terraform apply job
+    paths:
+      - terraform/tfplan                      
+
+apply:
+  stage: deploy
+  when: manual                       # The apply job is manually triggered by a user to avoid unintended changes to infrastructure
+  dependencies:
+    - aws-assume-role                   # Depends on 'aws-assume-role' to get AWS credentials
+    - plan                           # Download the artefact stored in previous 'plan' job
+  needs:
+    - aws-assume-role                   # Wait for the 'aws-assume-role' to complete first
+    - plan                            # Wait for plan job finishes as we need terraform plan file
+  image: 
+    name: hashicorp/terraform:1.11   
+    entrypoint: [""]                 # Override default entry point 'terraform' command                               
+  script:
+    - cd ./terraform/
+    - terraform init                            # Initialize Terraform again (ensure the environment is ready)
+    - terraform apply -auto-approve ./tfplan    # Use previously saved terraform plan, needs '-auto-approve' as we can't provide 'yes' input to Terraform
